@@ -1,0 +1,305 @@
+//@version=6
+// =============================================================================
+// Gridcontrolled Codex v1 - VISUAL  (Pine Script v6 indicator)
+// Faithful re-implementation of the logic in gridcontroled_codexv1_fixed.mq5
+// as a NON-trading visual: BUY/SELL labels, grid level lines, dashboard.
+//
+// Mapping / approximations vs the MQL5 EA (logic itself is identical):
+//   * Pine is bar-based -> one decision cycle per CONFIRMED bar
+//     (mirrors one Process()/ManageEntries cycle => <=1 add per side per bar).
+//   * No bid/ask in Pine -> uses close as reference & entry price; the spread
+//     input (default 0) only feeds the SpreadOkay() gate.
+//   * $ P/L uses ContractSize (units per lot) so the full-book +$ TP exit works.
+//   * Preserved: preset resolve, lot curve, spacing/burst, min-add seconds,
+//     quarter-gate, per-side resend guard, bootstrap + reopen, grid adds,
+//     full-book take-profit close-all + restart.
+// =============================================================================
+indicator("Gridcontrolled Codex v1 - Visual", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// ============================== INPUTS (mirror MQL5) =========================
+gC = "CORE"
+i_preset   = input.int(0, "PresetMode  0=HybridAuto 1=Legacy 2=Reduced", options = [0, 1, 2], group = gC)
+i_baseLot  = input.float(0.01, "BaseLot", step = 0.01, group = gC)
+i_maxLvl   = input.int(24, "MaxLevelsPerSide", minval = 1, group = gC)
+i_startNow = input.bool(true, "StartImmediately", group = gC)
+i_restart  = input.bool(true, "RestartAfterFullClose", group = gC)
+i_reopen   = input.bool(true, "ReopenClosedSideBase", group = gC)
+
+gS = "SAFETY"
+i_hardSL   = input.float(0.0, "HardStopMoneyOverride (parity, unused)", group = gS)
+i_maxBookM = input.int(0, "MaxBookMinutes (parity, unused)", group = gS)
+i_maxSprd  = input.int(800, "MaxSpreadPoints", group = gS)
+
+gE = "EXECUTION"
+i_tpUSD    = input.float(10.0, "CumulativeProfitExitUSD", group = gE)
+i_resendMs = input.int(1500, "MinResendMillis", group = gE)
+
+gV = "SIMULATION / VISUAL"
+i_spread   = input.int(0, "Simulated spread (points)", minval = 0, group = gV)
+i_contract = input.float(100.0, "Contract size units/lot ($P/L)  XAU=100 BTC=1 FX=100000", group = gV)
+i_volMin   = input.float(0.01, "Volume min", group = gV)
+i_volMax   = input.float(100.0, "Volume max", group = gV)
+i_volStep  = input.float(0.01, "Volume step", group = gV)
+i_ptOvr    = input.float(0.0, "Point size override (0 = use mintick)", group = gV)
+i_showLbl  = input.bool(true, "Show BUY/SELL labels", group = gV)
+i_showLn   = input.bool(true, "Show grid lines", group = gV)
+i_showDash = input.bool(true, "Show dashboard", group = gV)
+
+// ============================== CONFIG (preset resolve) ======================
+pointSz    = i_ptOvr > 0 ? i_ptOvr : syminfo.mintick
+resolved   = i_preset != 0 ? i_preset : (i_baseLot <= 0.0100001 ? 2 : 1)   // ResolvePreset()
+isLegacy   = resolved == 1
+curve      = isLegacy ? 0 : 1            // 0=Linear, 1=Geometric125
+spacingPts = isLegacy ? 180.0 : 460.0
+burstPts   = isLegacy ? 100.0 : 460.0
+minAddSec  = isLegacy ? 10 : 20
+quarterGate= isLegacy
+quarterWin = isLegacy ? 90 : 0
+tpMoney    = i_tpUSD
+
+// ============================== HELPERS ======================================
+p2p(p) => p * pointSz                                            // PointsToPrice()
+
+normVol(raw) =>                                                  // NormalizeVolumeForSymbol()
+    c = math.max(i_volMin, math.min(i_volMax, raw))
+    n = math.round(c / i_volStep) * i_volStep
+    math.max(i_volMin, math.min(i_volMax, n))
+
+lotForLevel(idx) =>                                              // LotForLevel()
+    raw = switch curve
+        0 => i_baseLot * (idx + 1)
+        1 => i_baseLot * math.pow(1.25, idx)
+        2 => i_baseLot * math.pow(2.0, math.floor(idx / 2.0))
+        => i_baseLot
+    normVol(raw)
+
+inQuarter(t, win) =>                                            // InQuarterWindow()
+    bool res = false
+    if win > 0
+        soh = minute(t) * 60 + second(t)
+        q = soh % 900
+        res := q <= win or q >= 900 - win
+    res
+
+sumProfit(arrP, arrV, isBuy) =>                                 // side total_profit (USD)
+    s = 0.0
+    n = array.size(arrP)
+    if n > 0
+        for i = 0 to n - 1
+            d = isBuy ? (close - array.get(arrP, i)) : (array.get(arrP, i) - close)
+            s += d * i_contract * array.get(arrV, i)
+    s
+
+wavg(arrP, arrV) =>                                            // weighted_entry
+    n = array.size(arrP)
+    tv = 0.0
+    sw = 0.0
+    if n > 0
+        for i = 0 to n - 1
+            tv += array.get(arrV, i)
+            sw += array.get(arrP, i) * array.get(arrV, i)
+    tv > 0 ? sw / tv : na
+
+// ============================== STATE ========================================
+var array<float> bP  = array.new<float>()   // BUY  entry prices  (index = level)
+var array<float> bV  = array.new<float>()   // BUY  volumes
+var array<int>   bT  = array.new<int>()     // BUY  open time (ms)
+var array<line>  bLn = array.new<line>()    // BUY  level lines
+var array<float> sP  = array.new<float>()   // SELL entry prices
+var array<float> sV  = array.new<float>()   // SELL volumes
+var array<int>   sT  = array.new<int>()     // SELL open time (ms)
+var array<line>  sLn = array.new<line>()    // SELL level lines
+
+var float  lastBuyOpenSec   = na            // g_last_buy_open
+var float  lastSellOpenSec  = na            // g_last_sell_open
+var float  lastFullCloseSec = na            // g_last_full_close
+var int    lastBuySendMs    = 0             // g_last_buy_send_msc
+var int    lastSellSendMs   = 0             // g_last_sell_send_msc
+var string lastAction       = "-"
+
+var line buyAvgLn  = na
+var line sellAvgLn = na
+var line buyTrgLn  = na
+var line sellTrgLn = na
+var table dash     = na
+
+setRow(int r, string a, string b, string c, color bg) =>
+    table.cell(dash, 0, r, a, text_color = color.white, text_size = size.small, text_halign = text.align_left,  bgcolor = bg)
+    table.cell(dash, 1, r, b, text_color = color.white, text_size = size.small, text_halign = text.align_right, bgcolor = bg)
+    table.cell(dash, 2, r, c, text_color = color.white, text_size = size.small, text_halign = text.align_right, bgcolor = bg)
+
+// ============================== MAIN (one cycle per confirmed bar) ===========
+price  = close
+nowMs  = time
+nowSec = time / 1000.0
+
+if barstate.isconfirmed
+    // --- snapshot before exit (CollectSideState) ---
+    bc0 = array.size(bP)
+    sc0 = array.size(sP)
+    book0 = sumProfit(bP, bV, true) + sumProfit(sP, sV, false)
+
+    // --- ManageExits: full-book TP only (matches Process) ---
+    if tpMoney > 0 and book0 > tpMoney and (bc0 + sc0) > 0
+        if array.size(bLn) > 0
+            for i = 0 to array.size(bLn) - 1
+                line.delete(array.get(bLn, i))
+        if array.size(sLn) > 0
+            for i = 0 to array.size(sLn) - 1
+                line.delete(array.get(sLn, i))
+        array.clear(bP)
+        array.clear(bV)
+        array.clear(bT)
+        array.clear(bLn)
+        array.clear(sP)
+        array.clear(sV)
+        array.clear(sT)
+        array.clear(sLn)
+        lastFullCloseSec := nowSec
+        lastAction := "CLOSE ALL +$" + str.tostring(book0, "#.##")
+        if i_showLbl
+            label.new(bar_index, high, "TP CLOSE\n+$" + str.tostring(book0, "#.##"), yloc = yloc.price, style = label.style_label_down, color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+
+    // --- re-snapshot after exit (CollectSideState), used by ManageEntries ---
+    bcE   = array.size(bP)
+    scE   = array.size(sP)
+    bNewE = bcE > 0 ? array.get(bP, bcE - 1) : na
+    sNewE = scE > 0 ? array.get(sP, scE - 1) : na
+    bNewTE= bcE > 0 ? array.get(bT, bcE - 1) : na
+    sNewTE= scE > 0 ? array.get(sT, scE - 1) : na
+
+    // --- BootstrapIfNeeded ---
+    canBoot = i_startNow
+    if not i_restart and bcE == 0 and scE == 0 and not na(lastFullCloseSec)
+        canBoot := false
+    if not na(lastFullCloseSec) and (nowSec - lastFullCloseSec) < 2     // delay_seconds = 2
+        canBoot := false
+
+    int buyLvl  = na
+    int sellLvl = na
+    if canBoot
+        if bcE == 0 and scE == 0
+            buyLvl  := 0
+            sellLvl := 0
+        else if i_reopen and bcE == 0 and scE > 0 and (na(lastBuyOpenSec)  or (nowSec - lastBuyOpenSec)  >= 2)
+            buyLvl  := 0
+        else if i_reopen and scE == 0 and bcE > 0 and (na(lastSellOpenSec) or (nowSec - lastSellOpenSec) >= 2)
+            sellLvl := 0
+
+    // --- ShouldAddToSide (buy priority, mutually exclusive ADDs) ---
+    advBuy   = bcE > 0 ? (bNewE - price) : na           // AdverseDistance BUY  = newest - current
+    advSell  = scE > 0 ? (price - sNewE) : na           // AdverseDistance SELL = current - newest
+    secBuyP  = bcE > 0 ? (nowMs - bNewTE) / 1000.0 : na
+    secBuyS  = na(lastBuyOpenSec)  ? secBuyP  : (nowSec - lastBuyOpenSec)
+    secBuy   = math.min(nz(secBuyP, 1e12), nz(secBuyS, 1e12))
+    secSellP = scE > 0 ? (nowMs - sNewTE) / 1000.0 : na
+    secSellS = na(lastSellOpenSec) ? secSellP : (nowSec - lastSellOpenSec)
+    secSell  = math.min(nz(secSellP, 1e12), nz(secSellS, 1e12))
+
+    shouldAddBuy  = bcE > 0 and bcE < i_maxLvl and price > 0 and bNewE > 0 and ((advBuy  >= p2p(burstPts) and secBuy  >= minAddSec) or (quarterGate and secBuy  >= minAddSec and inQuarter(time, quarterWin) and advBuy  >= p2p(spacingPts * 0.5)))
+    shouldAddSell = scE > 0 and scE < i_maxLvl and price > 0 and sNewE > 0 and ((advSell >= p2p(burstPts) and secSell >= minAddSec) or (quarterGate and secSell >= minAddSec and inQuarter(time, quarterWin) and advSell >= p2p(spacingPts * 0.5)))
+
+    buyAddFired = false
+    if na(buyLvl) and shouldAddBuy
+        buyLvl := bcE
+        buyAddFired := true
+    if not buyAddFired and na(sellLvl) and shouldAddSell
+        sellLvl := scE
+
+    // --- OpenSidePosition BUY (resend guard + SpreadOkay + volume) ---
+    if not na(buyLvl)
+        canSend  = i_resendMs <= 0 or lastBuySendMs == 0 or (nowMs - lastBuySendMs) >= i_resendMs
+        spreadOK = i_maxSprd <= 0 or i_spread <= i_maxSprd
+        vol = lotForLevel(buyLvl)
+        if canSend and spreadOK and vol > 0
+            lastBuySendMs := nowMs
+            array.push(bP, close)
+            array.push(bV, vol)
+            array.push(bT, nowMs)
+            lastBuyOpenSec := nowSec
+            lastAction := "BUY L" + str.tostring(buyLvl) + " " + str.tostring(vol, "#.##")
+            if i_showLn
+                array.push(bLn, line.new(bar_index, close, bar_index + 1, close, extend = extend.right, color = color.new(color.lime, 55), width = 1))
+            if i_showLbl
+                label.new(bar_index, low, "BUY L" + str.tostring(buyLvl) + "\n" + str.tostring(vol, "#.##"), yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+
+    // --- OpenSidePosition SELL ---
+    if not na(sellLvl)
+        canSend  = i_resendMs <= 0 or lastSellSendMs == 0 or (nowMs - lastSellSendMs) >= i_resendMs
+        spreadOK = i_maxSprd <= 0 or i_spread <= i_maxSprd
+        vol = lotForLevel(sellLvl)
+        if canSend and spreadOK and vol > 0
+            lastSellSendMs := nowMs
+            array.push(sP, close)
+            array.push(sV, vol)
+            array.push(sT, nowMs)
+            lastSellOpenSec := nowSec
+            lastAction := "SELL L" + str.tostring(sellLvl) + " " + str.tostring(vol, "#.##")
+            if i_showLn
+                array.push(sLn, line.new(bar_index, close, bar_index + 1, close, extend = extend.right, color = color.new(color.red, 55), width = 1))
+            if i_showLbl
+                label.new(bar_index, high, "SELL L" + str.tostring(sellLvl) + "\n" + str.tostring(vol, "#.##"), yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+
+// ============================== CURRENT STATE (for lines/dash) ===============
+bc  = array.size(bP)
+sc  = array.size(sP)
+bvT = 0.0
+svT = 0.0
+if bc > 0
+    for i = 0 to bc - 1
+        bvT += array.get(bV, i)
+if sc > 0
+    for i = 0 to sc - 1
+        svT += array.get(sV, i)
+bWA  = wavg(bP, bV)
+sWA  = wavg(sP, sV)
+bPL  = sumProfit(bP, bV, true)
+sPL  = sumProfit(sP, sV, false)
+book = bPL + sPL
+bNew = bc > 0 ? array.get(bP, bc - 1) : na
+sNew = sc > 0 ? array.get(sP, sc - 1) : na
+buyTrg  = na(bNew) ? na : bNew - p2p(burstPts)     // next BUY add level
+sellTrg = na(sNew) ? na : sNew + p2p(burstPts)     // next SELL add level
+
+// --- summary lines (weighted avg + next-add trigger), refreshed on last bar ---
+if barstate.islast and i_showLn
+    if not na(buyAvgLn)
+        line.delete(buyAvgLn)
+    if not na(sellAvgLn)
+        line.delete(sellAvgLn)
+    if not na(buyTrgLn)
+        line.delete(buyTrgLn)
+    if not na(sellTrgLn)
+        line.delete(sellTrgLn)
+    if not na(bWA)
+        buyAvgLn := line.new(bar_index - 3, bWA, bar_index, bWA, color = color.new(color.green, 0), width = 2, style = line.style_dotted, extend = extend.right)
+    if not na(sWA)
+        sellAvgLn := line.new(bar_index - 3, sWA, bar_index, sWA, color = color.new(color.red, 0), width = 2, style = line.style_dotted, extend = extend.right)
+    if not na(buyTrg)
+        buyTrgLn := line.new(bar_index - 3, buyTrg, bar_index, buyTrg, color = color.new(color.lime, 0), width = 1, style = line.style_dashed, extend = extend.right)
+    if not na(sellTrg)
+        sellTrgLn := line.new(bar_index - 3, sellTrg, bar_index, sellTrg, color = color.new(color.orange, 0), width = 1, style = line.style_dashed, extend = extend.right)
+
+// ============================== DASHBOARD ====================================
+status     = (bc == 0 and sc == 0) ? (na(lastFullCloseSec) ? "WAITING bootstrap" : "FLAT - restart armed") : "RUNNING"
+presetName = resolved == 1 ? "LegacyQuarterHour" : "ReducedReactive"
+
+if i_showDash and barstate.islast
+    if na(dash)
+        dash := table.new(position.top_right, 3, 16, border_width = 1, frame_width = 1, frame_color = color.gray)
+    setRow(0,  "Gridctl Codex v1 (visual)", "", "", color.new(color.blue, 0))
+    setRow(1,  "Field", "BUY", "SELL", color.new(color.gray, 25))
+    setRow(2,  "Positions", str.tostring(bc), str.tostring(sc), na)
+    setRow(3,  "Volume", str.tostring(bvT, "#.##"), str.tostring(svT, "#.##"), na)
+    setRow(4,  "Wtd entry", na(bWA) ? "-" : str.tostring(bWA, format.mintick), na(sWA) ? "-" : str.tostring(sWA, format.mintick), na)
+    setRow(5,  "P/L $", str.tostring(bPL, "#.##"), str.tostring(sPL, "#.##"), na)
+    setRow(6,  "Next add @", na(buyTrg) ? "-" : str.tostring(buyTrg, format.mintick), na(sellTrg) ? "-" : str.tostring(sellTrg, format.mintick), na)
+    setRow(7,  "Next lot", str.tostring(lotForLevel(bc), "#.##"), str.tostring(lotForLevel(sc), "#.##"), na)
+    setRow(8,  "Book P/L $", str.tostring(book, "#.##"), "", book >= 0 ? color.new(color.green, 60) : color.new(color.red, 60))
+    setRow(9,  "Preset", presetName, "", na)
+    setRow(10, "Curve", curve == 0 ? "Linear" : "Geo 1.25", "", na)
+    setRow(11, "Spacing/Burst pt", str.tostring(spacingPts, "#") + " / " + str.tostring(burstPts, "#"), "", na)
+    setRow(12, "Min add sec", str.tostring(minAddSec), "", na)
+    setRow(13, "Full TP $", str.tostring(tpMoney, "#.##"), "", na)
+    setRow(14, "Last action", lastAction, "", na)
+    setRow(15, "Status", status, "", na)
